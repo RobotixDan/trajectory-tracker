@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shot Tracker – trajectory overlays from slow-mo video</title>
+<style>
+  :root { --bg:#0b0d12; --card:#151823; --line:#2c2f45; --txt:#f4f1fa; --dim:#a9a3bd; --acc:#7b2cbf; --acc2:#9d4edd; --green:#4caf50; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 20px 16px 60px; }
+  h1 { font-size: 1.5rem; margin: 6px 0 2px; }
+  p.sub { color: var(--dim); margin: 0 0 18px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  label { color: var(--dim); font-size: .9rem; }
+  button, .btn { appearance:none; border:0; border-radius:10px; padding:12px 16px; font:inherit; font-weight:600; cursor:pointer;
+                 background: var(--acc); color:#fff; }
+  button:hover:not(:disabled) { background: var(--acc2); }
+  button.sec { background:#262a3d; color:var(--txt); }
+  button:disabled { opacity:.45; cursor:default; }
+  select, input[type=range] { font:inherit; accent-color: var(--acc2); }
+  progress { accent-color: var(--green); }
+  h1 { background: linear-gradient(90deg,#fff,#c9a6ff); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .card { border-top: 3px solid var(--acc); }
+  select { background:#1d2030; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:8px; }
+  input[type=file] { width:100%; color: var(--dim); }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; }
+  .chip { padding:8px 14px; border-radius:999px; border:1px solid var(--line); background:#1d2030; color:var(--txt); cursor:pointer; font-weight:600; }
+  .chip.on { background: var(--acc); color:#fff; border-color: var(--acc2); }
+  canvas#view { width:100%; height:auto; border-radius:10px; background:#000; display:block; }
+  progress { width:100%; height:10px; }
+  #status { color: var(--dim); min-height: 1.4em; }
+  .tips { color: var(--dim); font-size:.9rem; margin: 0; padding-left: 18px; }
+  details summary { cursor:pointer; color: var(--dim); }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Shot Tracker</h1>
+  <p class="sub">Upload a slow-mo clip of your shooter and get every shot's trajectory drawn on one image and one video. Everything runs in your browser; your video is never uploaded.</p>
+
+  <div class="card">
+    <input type="file" id="file" accept="video/*">
+    <p class="tips" style="margin-top:10px">Tips: camera held still (tripod), side-on to the shot path, original slo-mo file (120/240 fps) and a ball that stands out from the background.</p>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:12px">
+      <label>Ball colour</label>
+      <div class="chips" id="chips">
+        <div class="chip on" data-c="yellow">Yellow</div>
+        <div class="chip" data-c="red">Red (experimental)</div>
+        <div class="chip" data-c="blue">Blue (experimental)</div>
+      </div>
+    </div>
+    <div class="row" style="margin-bottom:12px">
+      <label for="sens">Sensitivity</label>
+      <input type="range" id="sens" min="15" max="60" value="28">
+      <span class="tips" style="padding:0">lower = picks up fainter balls (more false hits)</span>
+    </div>
+    <div class="row">
+      <button id="go" disabled>Find shots</button>
+      <span id="status">Choose a video to begin.</span>
+    </div>
+    <progress id="prog" class="hidden" value="0" max="1"></progress>
+  </div>
+
+  <div class="card hidden" id="result">
+    <canvas id="view"></canvas>
+    <div class="row" style="margin:12px 0 4px">
+      <label for="ext">Extend arcs back toward launch</label>
+      <input type="range" id="ext" min="0" max="100" value="0">
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button id="png">Download image (PNG)</button>
+      <button id="vid" class="sec">Make video</button>
+      <span id="vstat" class="tips" style="padding:0"></span>
+    </div>
+    <details style="margin-top:12px"><summary>Not what you expected?</summary>
+      <ul class="tips">
+        <li>No shots found: try a lower sensitivity, check the ball colour, or use a clip where the camera doesn't move.</li>
+        <li>Extra lines: raise the sensitivity slider (higher number) and run again.</li>
+        <li>Arcs start mid-air: the ball is blurry near the shooter. A true slo-mo clip helps, or use the "extend arcs" slider.</li>
+      </ul>
+    </details>
+  </div>
+</main>
+
+<video id="v" muted playsinline preload="auto" class="hidden"></video>
+
+<script>
+/**
+ * Shot Tracker core: ball detection and trajectory fitting.
+ * Pure JavaScript, no dependencies. Works in the browser and in Node (for tests).
+ *
+ * Pipeline:
+ *   1. buildBackground()  - per-pixel median of sampled frames = the empty scene
+ *   2. makeDetector()     - per frame: pixels that are ball-coloured AND differ from the
+ *                           background, grouped into blobs, filtered by size and shape
+ *   3. findFlights()      - fits a parabola through the blobs of each shot (RANSAC),
+ *                           rejecting junk that does not look like a ballistic arc
+ */
+(function (root) {
+  'use strict';
+
+  /** Colour presets. Hue in degrees (0-360); hmin > hmax means the range wraps past red. */
+  const PRESETS = {
+    yellow: { name: 'Yellow', hmin: 20, hmax: 85, smin: 0.2, vmin: 0.4 },
+    blue: { name: 'Blue', hmin: 190, hmax: 260, smin: 0.35, vmin: 0.2 },
+    red: { name: 'Red', hmin: 340, hmax: 20, smin: 0.45, vmin: 0.3 },
+  };
+
+  /**
+   * Per-pixel median of several frames, i.e. the scene with moving things removed.
+   * @param {Uint8ClampedArray[]} frames RGBA frames, all W*H*4
+   * @param {number} W width
+   * @param {number} H height
+   * @return {Uint8ClampedArray} RGBA background image
+   */
+  function buildBackground(frames, W, H) {
+    const K = frames.length;
+    const out = new Uint8ClampedArray(W * H * 4);
+    const tmp = new Uint8Array(K);
+    const mid = K >> 1;
+    for (let p = 0; p < W * H; p++) {
+      for (let c = 0; c < 3; c++) {
+        for (let k = 0; k < K; k++) tmp[k] = frames[k][p * 4 + c];
+        tmp.sort();
+        out[p * 4 + c] = tmp[mid];
+      }
+      out[p * 4 + 3] = 255;
+    }
+    return out;
+  }
+
+  /**
+   * Create a detector for frames of a fixed size (re-uses its buffers between calls).
+   * @param {number} W width
+   * @param {number} H height
+   * @return {function(Uint8ClampedArray, Uint8ClampedArray, Object, number): Array}
+   *   detect(frameRGBA, bgRGBA, preset, diffThreshold) -> [{x, y, area}]
+   */
+  function makeDetector(W, H) {
+    const n = W * H;
+    const mask = new Uint8Array(n);
+    const mask2 = new Uint8Array(n);
+    const vis = new Uint8Array(n);
+    const stack = new Int32Array(n);
+    const minA = 0.00006 * n;
+    const maxA = 0.0016 * n;
+    const maxDim = 0.12 * W;
+
+    return function detect(f, bg, preset, thr) {
+      mask.fill(0);
+      const { hmin, hmax, smin, vmin } = preset;
+      const wrap = hmin > hmax;
+      for (let p = 0, q = 0; p < n; p++, q += 4) {
+        const r = f[q], g = f[q + 1], b = f[q + 2];
+        // 1) must differ from the empty background
+        let d = r - bg[q]; if (d < 0) d = -d;
+        let d2 = g - bg[q + 1]; if (d2 < 0) d2 = -d2; if (d2 > d) d = d2;
+        d2 = b - bg[q + 2]; if (d2 < 0) d2 = -d2; if (d2 > d) d = d2;
+        if (d <= thr) continue;
+        // 2) must be ball-coloured (HSV)
+        const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+        const dd = mx - mn;
+        if (mx === 0 || dd / mx < smin || mx / 255 < vmin) continue;
+        let h;
+        if (mx === r) h = 60 * (((g - b) / dd) % 6);
+        else if (mx === g) h = 60 * ((b - r) / dd + 2);
+        else h = 60 * ((r - g) / dd + 4);
+        if (h < 0) h += 360;
+        if (wrap ? (h >= hmin || h <= hmax) : (h >= hmin && h <= hmax)) mask[p] = 1;
+      }
+      // 3x3 dilation so a blurred ball becomes one blob
+      mask2.fill(0);
+      for (let y = 1; y < H - 1; y++) {
+        for (let x = 1; x < W - 1; x++) {
+          const p = y * W + x;
+          if (mask[p]) {
+            mask2[p - W - 1] = mask2[p - W] = mask2[p - W + 1] = 1;
+            mask2[p - 1] = mask2[p] = mask2[p + 1] = 1;
+            mask2[p + W - 1] = mask2[p + W] = mask2[p + W + 1] = 1;
+          }
+        }
+      }
+      // connected components (8-neighbour flood fill)
+      vis.fill(0);
+      const out = [];
+      for (let s = 0; s < n; s++) {
+        if (!mask2[s] || vis[s]) continue;
+        let sp = 0, area = 0, sx = 0, sy = 0, x0 = W, x1 = 0, y0 = H, y1 = 0;
+        stack[sp++] = s; vis[s] = 1;
+        while (sp) {
+          const p = stack[--sp];
+          const px = p % W, py = (p / W) | 0;
+          area++; sx += px; sy += py;
+          if (px < x0) x0 = px; if (px > x1) x1 = px;
+          if (py < y0) y0 = py; if (py > y1) y1 = py;
+          for (let dy = -1; dy <= 1; dy++) {
+            const ny = py + dy; if (ny < 0 || ny >= H) continue;
+            for (let dx = -1; dx <= 1; dx++) {
+              const nx = px + dx; if (nx < 0 || nx >= W) continue;
+              const np = ny * W + nx;
+              if (mask2[np] && !vis[np]) { vis[np] = 1; stack[sp++] = np; }
+            }
+          }
+        }
+        const w = x1 - x0 + 1, h = y1 - y0 + 1;
+        if (area >= minA && area <= maxA && Math.max(w, h) <= maxDim &&
+            Math.max(w, h) / Math.min(w, h) < 2.5) {
+          out.push({ x: sx / area, y: sy / area, area });
+        }
+      }
+      return out;
+    };
+  }
+
+  // ---- parabola helpers (normalised coordinates: x/W, y/H) ------------------------------
+
+  /** Least-squares fit y = a x^2 + b x + c. @return {number[]|null} [a,b,c] */
+  function fitParabola(xs, ys) {
+    let s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, t0 = 0, t1 = 0, t2 = 0;
+    for (let i = 0; i < xs.length; i++) {
+      const x = xs[i], y = ys[i], x2 = x * x;
+      s0++; s1 += x; s2 += x2; s3 += x2 * x; s4 += x2 * x2;
+      t0 += y; t1 += x * y; t2 += x2 * y;
+    }
+    const M = [[s4, s3, s2, t2], [s3, s2, s1, t1], [s2, s1, s0, t0]];
+    for (let i = 0; i < 3; i++) {
+      let piv = i;
+      for (let r = i + 1; r < 3; r++) if (Math.abs(M[r][i]) > Math.abs(M[piv][i])) piv = r;
+      if (Math.abs(M[piv][i]) < 1e-12) return null;
+      [M[i], M[piv]] = [M[piv], M[i]];
+      for (let r = i + 1; r < 3; r++) {
+        const k = M[r][i] / M[i][i];
+        for (let c = i; c < 4; c++) M[r][c] -= k * M[i][c];
+      }
+    }
+    const co = [0, 0, 0];
+    for (let i = 2; i >= 0; i--) {
+      let v = M[i][3];
+      for (let c = i + 1; c < 3; c++) v -= M[i][c] * co[c];
+      co[i] = v / M[i][i];
+    }
+    return co;
+  }
+
+  /** Y (in pixels) of a fitted flight at pixel x. */
+  function yAt(f, x, W, H) {
+    const u = x / W;
+    return H * (f.co[0] * u * u + f.co[1] * u + f.co[2]);
+  }
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /**
+   * Group per-frame ball candidates into shots and fit a parabola to each.
+   * @param {Array<Array<{x:number,y:number,area:number}>>} dets candidates per sampled frame
+   * @param {number} W frame width the coordinates are in
+   * @param {number} H frame height
+   * @return {Array<Object>} flights: {co, pts:[{i,x,y}], i0, i1, x0, x1}
+   */
+  function findFlights(dets, W, H) {
+    const N = dets.length;
+    // 1) drop candidates that sit in the same place for a long time (static objects)
+    const cs = Math.max(4, Math.round(W * 0.012));
+    const cnt = new Map();
+    const key = (x, y) => Math.round(x / cs) + ',' + Math.round(y / cs);
+    for (const d of dets) for (const c of d) cnt.set(key(c.x, c.y), (cnt.get(key(c.x, c.y)) || 0) + 1);
+    const staticLimit = Math.max(10, 0.035 * N);
+    // ...and candidates that stay put for several nearby frames (a parked ball, a robot part)
+    const r2 = (0.01 * W) ** 2, R = 8;
+    const parked = (i, c) => {
+      let n = 0;
+      for (let j = Math.max(0, i - R); j <= Math.min(N - 1, i + R); j++) {
+        if (j === i) continue;
+        for (const o of dets[j]) { if ((o.x - c.x) ** 2 + (o.y - c.y) ** 2 < r2) { n++; break; } }
+      }
+      return n >= R;
+    };
+    const cand = [];
+    for (let i = 0; i < N; i++) {
+      for (const c of dets[i]) {
+        if (cnt.get(key(c.x, c.y)) <= staticLimit && !parked(i, c)) cand.push({ i, x: c.x, y: c.y });
+      }
+    }
+    // 2) split into time windows wherever nothing is seen for a while
+    const gap = Math.max(10, Math.round(N * 0.02));
+    const windows = [];
+    let cur = [];
+    for (const c of cand) {
+      if (cur.length && c.i - cur[cur.length - 1].i > gap) { windows.push(cur); cur = []; }
+      cur.push(c);
+    }
+    if (cur.length) windows.push(cur);
+
+    const tol = 0.01 * H;       // how close (px) a point must be to the arc to count
+    const minInl = 8;
+    const rng = mulberry32(7);
+    const flights = [];
+
+    const maxGap = Math.max(10, Math.round(N * 0.016));
+    /** Keep only the longest stretch of points that follow each other in time. */
+    function largestRun(pts) {
+      const a = pts.slice().sort((p, q) => p.i - q.i);
+      let best = [], run = [];
+      for (const p of a) {
+        if (run.length && p.i - run[run.length - 1].i > maxGap) { if (run.length > best.length) best = run; run = []; }
+        run.push(p);
+      }
+      return run.length > best.length ? run : best;
+    }
+
+    function ransac(pts) {
+      let best = null;
+      const m = pts.length;
+      for (let it = 0; it < 2500; it++) {
+        const a = pts[(rng() * m) | 0], b = pts[(rng() * m) | 0], c = pts[(rng() * m) | 0];
+        if (Math.abs(a.x - b.x) < 0.03 * W || Math.abs(a.x - c.x) < 0.03 * W ||
+            Math.abs(b.x - c.x) < 0.03 * W) continue;
+        const co = fitParabola([a.x / W, b.x / W, c.x / W], [a.y / H, b.y / H, c.y / H]);
+        if (!co || co[0] <= 0) continue;
+        let n = 0;
+        for (const p of pts) {
+          const u = p.x / W;
+          if (Math.abs(H * (co[0] * u * u + co[1] * u + co[2]) - p.y) < tol) n++;
+        }
+        if (!best || n > best.n) best = { n, co };
+      }
+      if (!best) return null;
+      // refine with least squares on the inliers
+      let co = best.co, inl = [];
+      for (let k = 0; k < 3; k++) {
+        inl = pts.filter((p) => {
+          const u = p.x / W;
+          return Math.abs(H * (co[0] * u * u + co[1] * u + co[2]) - p.y) < tol;
+        });
+        inl = largestRun(inl);
+        if (inl.length < 3) return null;
+        const nc = fitParabola(inl.map((p) => p.x / W), inl.map((p) => p.y / H));
+        if (!nc) return null;
+        co = nc;
+      }
+      return { co, inl };
+    }
+
+    function accept(co, inl) {
+      // one point per frame (closest to the curve)
+      const byFrame = new Map();
+      for (const p of inl) {
+        const u = p.x / W, r = Math.abs(H * (co[0] * u * u + co[1] * u + co[2]) - p.y);
+        const o = byFrame.get(p.i);
+        if (!o || r < o.r) byFrame.set(p.i, { p, r });
+      }
+      const P = [...byFrame.values()].map((o) => o.p).sort((a, b) => a.i - b.i);
+      if (P.length < minInl) return null;
+      const xs = P.map((p) => p.x), ys = P.map((p) => p.y);
+      const spanX = Math.max(...xs) - Math.min(...xs), spanY = Math.max(...ys) - Math.min(...ys);
+      if (spanX < 0.25 * W || spanY < 0.10 * H) return null;
+      // x must move steadily in one direction over time
+      const mi = P.reduce((s, p) => s + p.i, 0) / P.length, mx = xs.reduce((s, v) => s + v, 0) / P.length;
+      let sxy = 0, sxx = 0, syy = 0;
+      for (const p of P) { sxy += (p.i - mi) * (p.x - mx); sxx += (p.i - mi) ** 2; syy += (p.x - mx) ** 2; }
+      if (Math.abs(sxy / Math.sqrt(sxx * syy)) < 0.9) return null;
+      const curv = co[0];   // curvature in normalised coordinates, sanity-bounded
+      if (curv < 0.05 || curv > 10) return null;
+      return { co, pts: P, i0: P[0].i, i1: P[P.length - 1].i, x0: P[0].x, x1: P[P.length - 1].x };
+    }
+
+    for (const win of windows) {
+      let rem = win.slice();
+      for (let k = 0; k < 6 && rem.length >= minInl; k++) {
+        const r = ransac(rem);
+        if (!r) break;
+        const f = accept(r.co, r.inl);
+        if (f) flights.push(f);
+        const s = new Set(r.inl);
+        rem = rem.filter((p) => !s.has(p));
+      }
+    }
+    flights.sort((a, b) => a.i0 - b.i0);
+    return flights;
+  }
+
+  const Core = { PRESETS, buildBackground, makeDetector, findFlights, fitParabola, yAt };
+  if (typeof module !== 'undefined' && module.exports) module.exports = Core;
+  else root.ShotCore = Core;
+})(typeof self !== 'undefined' ? self : this);
+
+</script>
+<script>
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById(id);
+  const v = $('v'), view = $('view'), vctx = view.getContext('2d');
+  const COLORS = ['#ff9500', '#50e63c', '#ff3cdc', '#2bd4ff', '#ffe14a', '#8c7bff'];
+  let color = 'yellow', fileURL = null;
+  let W = 0, H = 0, cw = 0, ch = 0;      // analysis size / output size
+  let flights = [], times = [], base = null;
+
+  document.querySelectorAll('.chip').forEach((c) => c.addEventListener('click', () => {
+    document.querySelectorAll('.chip').forEach((x) => x.classList.remove('on'));
+    c.classList.add('on'); color = c.dataset.c;
+  }));
+
+  $('file').addEventListener('change', (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    if (fileURL) URL.revokeObjectURL(fileURL);
+    fileURL = URL.createObjectURL(f);
+    v.src = fileURL; $('go').disabled = true; $('result').classList.add('hidden');
+    $('status').textContent = 'Loading video…';
+    v.onloadeddata = () => { $('go').disabled = false; $('status').textContent = `Loaded (${v.videoWidth}×${v.videoHeight}, ${v.duration.toFixed(1)} s). Press “Find shots”.`; };
+    v.onerror = () => { $('status').textContent = 'Could not open that video file.'; };
+  });
+
+  const seek = (t) => new Promise((res) => {
+    if (Math.abs(v.currentTime - t) < 1e-4) return res();
+    let done = false;
+    const fin = () => { if (!done) { done = true; v.removeEventListener('seeked', fin); res(); } };
+    v.addEventListener('seeked', fin); setTimeout(fin, 4000); v.currentTime = t;
+  });
+
+  $('go').addEventListener('click', async () => {
+    $('go').disabled = true; $('result').classList.add('hidden');
+    try { await analyse(); } catch (err) { console.error(err); $('status').textContent = 'Something went wrong: ' + err.message; }
+    $('go').disabled = false; $('prog').classList.add('hidden');
+  });
+
+  async function analyse() {
+    const vw = v.videoWidth, vh = v.videoHeight, dur = v.duration;
+    W = 360; H = Math.round(W * vh / vw);
+    const sc = Math.min(1, 1280 / Math.max(vw, vh)); cw = Math.round(vw * sc); ch = Math.round(vh * sc);
+    const N = Math.min(720, Math.max(30, Math.floor(dur * 240)));
+    times = Array.from({ length: N }, (_, k) => (k + 0.5) * dur / N);
+    const cnv = document.createElement('canvas'); cnv.width = W; cnv.height = H;
+    const cx = cnv.getContext('2d', { willReadFrequently: true });
+    const grab = async (t) => { await seek(t); cx.drawImage(v, 0, 0, W, H); return cx.getImageData(0, 0, W, H).data; };
+    const prog = $('prog'); prog.classList.remove('hidden');
+
+    $('status').textContent = 'Learning the empty scene…';
+    const bgFrames = [], K = Math.min(40, N);
+    for (let k = 0; k < K; k++) { bgFrames.push(new Uint8ClampedArray(await grab(times[Math.floor(k * N / K)]))); prog.value = 0.1 * k / K; }
+    const bg = ShotCore.buildBackground(bgFrames, W, H);
+    bgFrames.length = 0;
+
+    const detect = ShotCore.makeDetector(W, H), preset = ShotCore.PRESETS[color], thr = +$('sens').value;
+    const dets = [];
+    for (let k = 0; k < N; k++) {
+      dets.push(detect(await grab(times[k]), bg, preset, thr));
+      if (k % 10 === 0) { prog.value = 0.1 + 0.85 * k / N; $('status').textContent = `Tracking… ${Math.round(100 * k / N)}%`; }
+    }
+    flights = ShotCore.findFlights(dets, W, H);
+    for (const f of flights) {
+      f.pts.forEach((p) => { p.t = times[p.i]; });
+      f.t0 = f.pts[0].t; f.t1 = f.pts[f.pts.length - 1].t;
+    }
+    // grab a clean-ish base frame at full output size
+    await seek(0);
+    base = document.createElement('canvas'); base.width = cw; base.height = ch;
+    base.getContext('2d').drawImage(v, 0, 0, cw, ch);
+    view.width = cw; view.height = ch;
+    $('result').classList.remove('hidden');
+    redraw();
+    $('status').textContent = flights.length
+      ? `Found ${flights.length} shot${flights.length > 1 ? 's' : ''}.`
+      : 'No shots found. Try another ball colour or sensitivity (see tips below).';
+  }
+
+  // ---- drawing --------------------------------------------------------------------------
+  /** Start x of the (optionally extended) arc, and the matching start time. */
+  function extent(f) {
+    const e = +$('ext').value / 100, dir = f.x0 > f.x1 ? 1 : -1;
+    const xs0 = f.x0 + dir * Math.abs(f.x0 - f.x1) * e;
+    const vx = (f.x1 - f.x0) / Math.max(1e-6, f.t1 - f.t0);
+    return { xs0, ts0: f.t0 - Math.abs(xs0 - f.x0) / Math.max(1e-6, Math.abs(vx)) };
+  }
+  function xAtTime(f, ex, t) {
+    const pts = [{ t: ex.ts0, x: ex.xs0 }, ...f.pts];
+    if (t <= pts[0].t) return pts[0].x;
+    for (let k = 1; k < pts.length; k++) {
+      if (t <= pts[k].t) { const a = pts[k - 1], b = pts[k]; return a.x + (b.x - a.x) * (t - a.t) / Math.max(1e-9, b.t - a.t); }
+    }
+    return f.x1;
+  }
+  /** Draw all shots. t = media time while playing, or null for the finished picture. */
+  function overlay(ctx, t) {
+    const s = ctx.canvas.width / W, lw = Math.max(4, ctx.canvas.width * 0.007);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    flights.forEach((f, k) => {
+      const col = COLORS[k % COLORS.length], ex = extent(f);
+      let xb = f.x1, done = true;
+      if (t !== null) { if (t < ex.ts0) return; if (t < f.t1) { xb = xAtTime(f, ex, t); done = false; } }
+      ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.beginPath();
+      const step = (ex.xs0 < xb ? 1 : -1) * 2;
+      let first = true;
+      for (let x = ex.xs0; step > 0 ? x <= xb : x >= xb; x += step) {
+        const px = x * s, py = ShotCore.yAt(f, x, W, H) * s;
+        if (first) { ctx.moveTo(px, py); first = false; } else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+      if (!done || (t !== null && t < f.t1 + 0.25)) {
+        ctx.beginPath(); ctx.arc(xb * s, ShotCore.yAt(f, xb, W, H) * s, lw * 4.5, 0, 6.2832); ctx.lineWidth = lw * 0.9; ctx.stroke();
+      }
+      if (done) {   // number the arc at its apex
+        let ax = f.x1, ay = 1e9;
+        for (let x = Math.min(ex.xs0, f.x1); x <= Math.max(ex.xs0, f.x1); x += 2) { const y = ShotCore.yAt(f, x, W, H); if (y < ay) { ay = y; ax = x; } }
+        ctx.fillStyle = col; ctx.font = `bold ${Math.round(lw * 6)}px system-ui,sans-serif`; ctx.textAlign = 'center';
+        ctx.fillText(String(k + 1), ax * s, ay * s - lw * 5);
+      }
+    });
+  }
+  function redraw() {
+    if (!base) return;
+    vctx.drawImage(base, 0, 0); overlay(vctx, null);
+  }
+  $('ext').addEventListener('input', redraw);
+
+  // ---- exports --------------------------------------------------------------------------
+  $('png').addEventListener('click', () => {
+    view.toBlob((b) => download(b, 'shot-trajectories.png'), 'image/png');
+  });
+  function download(blob, name) {
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  }
+
+  $('vid').addEventListener('click', async () => {
+    if (!flights.length) return;
+    if (typeof MediaRecorder === 'undefined') { $('vstat').textContent = 'This browser can’t record video. Try Chrome or Safari on a computer.'; return; }
+    const mimes = ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+    const mime = mimes.find((m) => MediaRecorder.isTypeSupported(m)) || '';
+    const ext = mime.startsWith('video/mp4') ? 'mp4' : 'webm';
+    $('vid').disabled = true; $('png').disabled = true;
+    const rc = document.createElement('canvas'); rc.width = cw; rc.height = ch;
+    const rx = rc.getContext('2d');
+    const rec = new MediaRecorder(rc.captureStream(30), { mimeType: mime || undefined, videoBitsPerSecond: 8e6 });
+    const chunks = []; rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    const stopped = new Promise((r) => { rec.onstop = r; });
+    const tA = Math.max(0, Math.min(...flights.map((f) => extent(f).ts0)) - 0.5);
+    const tB = Math.min(v.duration, Math.max(...flights.map((f) => f.t1)) + 0.7);
+    await seek(tA);
+    rx.drawImage(v, 0, 0, cw, ch);
+    rec.start();
+    v.play();
+    await new Promise((resolve) => {
+      const loop = () => {
+        const t = v.currentTime;
+        rx.drawImage(v, 0, 0, cw, ch); overlay(rx, t);
+        $('vstat').textContent = `Recording… ${Math.min(100, Math.round(100 * (t - tA) / (tB - tA)))}%`;
+        if (t >= tB || v.ended) { v.pause(); resolve(); } else requestAnimationFrame(loop);
+      };
+      requestAnimationFrame(loop);
+    });
+    // hold the finished picture for two seconds
+    rx.drawImage(base, 0, 0); overlay(rx, null);
+    await new Promise((r) => setTimeout(r, 2000));
+    rec.stop(); await stopped;
+    download(new Blob(chunks, { type: mime || 'video/webm' }), `shot-trajectories.${ext}`);
+    $('vstat').textContent = `Saved .${ext}${ext === 'webm' ? ' (some apps can’t open .webm; a free converter makes it .mp4)' : ''}.`;
+    $('vid').disabled = false; $('png').disabled = false;
+  });
+})();
+</script>
+</body>
+</html>
