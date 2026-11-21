@@ -34,6 +34,13 @@
   .tips { color: var(--dim); font-size:.9rem; margin: 0; padding-left: 18px; }
   details summary { cursor:pointer; color: var(--dim); }
   .hidden { display:none; }
+  input[type=text], input[type=number] { background:#1d2030; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:8px; font:inherit; }
+  input[type=text] { flex:1; min-width:180px; } input[type=number] { width:110px; }
+  table { border-collapse:collapse; width:100%; font-size:.92rem; }
+  th, td { padding:7px 10px; text-align:right; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:var(--dim); font-weight:600; }
+  tr.sum td { color:var(--acc2); font-weight:600; }
 </style>
 </head>
 <body>
@@ -73,6 +80,19 @@
       <label for="ext">Extend arcs back toward launch</label>
       <input type="range" id="ext" min="0" max="100" value="0">
     </div>
+    <div class="row" style="margin:14px 0 4px">
+      <label for="tag">Label</label>
+      <input type="text" id="tag" placeholder="e.g. flywheel 3200 rpm, hood 40°">
+    </div>
+    <div class="row" style="margin:8px 0">
+      <label for="diam">Ball diameter (mm)</label><input type="number" id="diam" min="1" step="0.1" placeholder="optional">
+      <label for="slow">Slow-mo factor</label><input type="number" id="slow" min="1" step="0.1" value="1">
+    </div>
+    <div class="row" style="margin:8px 0">
+      <button id="goalbtn" class="sec">Mark goal</button>
+      <button id="goalclr" class="sec hidden">Clear goal</button>
+      <span id="goalhint" class="tips" style="padding:0">Tap the goal opening on the picture to measure each shot against it.</span>
+    </div>
     <div class="row" style="margin-top:12px">
       <button id="png">Download image (PNG)</button>
       <button id="vid" class="sec">Make video</button>
@@ -87,6 +107,16 @@
     </details>
   </div>
 </main>
+
+<div class="card hidden" id="statscard" style="max-width:760px;margin:0 auto 60px;margin-top:-40px">
+  <h2 style="margin:0 0 4px;font-size:1.1rem">Shot stats</h2>
+  <p class="tips" id="unitnote" style="padding:0 0 8px;margin:0"></p>
+  <div style="overflow-x:auto"><table id="stats"></table></div>
+  <div class="row" style="margin-top:12px">
+    <button id="csv" class="sec">Download CSV</button>
+    <button id="copy" class="sec">Copy table</button>
+  </div>
+</div>
 
 <video id="v" muted playsinline preload="auto" class="hidden"></video>
 
@@ -292,7 +322,7 @@
     const cand = [];
     for (let i = 0; i < N; i++) {
       for (const c of dets[i]) {
-        if (cnt.get(key(c.x, c.y)) <= staticLimit && !parked(i, c)) cand.push({ i, x: c.x, y: c.y });
+        if (cnt.get(key(c.x, c.y)) <= staticLimit && !parked(i, c)) cand.push({ i, x: c.x, y: c.y, a: c.area });
       }
     }
     // 2) split into time windows wherever nothing is seen for a while
@@ -355,7 +385,8 @@
       return { co, inl };
     }
 
-    function accept(co, inl) {
+    /** Build a flight from inlier points. Relaxed limits keep short fragments for merging. */
+    function accept(co, inl, relaxed) {
       // one point per frame (closest to the curve)
       const byFrame = new Map();
       for (const p of inl) {
@@ -364,10 +395,11 @@
         if (!o || r < o.r) byFrame.set(p.i, { p, r });
       }
       const P = [...byFrame.values()].map((o) => o.p).sort((a, b) => a.i - b.i);
-      if (P.length < minInl) return null;
+      const minN = relaxed ? 4 : minInl, minX = relaxed ? 0.03 : 0.25, minY = relaxed ? 0.015 : 0.10;
+      if (P.length < minN) return null;
       const xs = P.map((p) => p.x), ys = P.map((p) => p.y);
       const spanX = Math.max(...xs) - Math.min(...xs), spanY = Math.max(...ys) - Math.min(...ys);
-      if (spanX < 0.25 * W || spanY < 0.10 * H) return null;
+      if (spanX < minX * W || spanY < minY * H) return null;
       // x must move steadily in one direction over time
       const mi = P.reduce((s, p) => s + p.i, 0) / P.length, mx = xs.reduce((s, v) => s + v, 0) / P.length;
       let sxy = 0, sxx = 0, syy = 0;
@@ -378,16 +410,61 @@
       return { co, pts: P, i0: P[0].i, i1: P[P.length - 1].i, x0: P[0].x, x1: P[P.length - 1].x };
     }
 
+    /**
+     * Join fragments of one shot. The ball can vanish for a few frames (e.g. in front of a
+     * bright light) which splits a shot in two; two fragments are joined when one arc fits
+     * both of them well and they follow each other in time.
+     */
+    function mergeFragments(frs) {
+      const maxMerge = Math.max(20, Math.round(N * 0.08));
+      let changed = true;
+      while (changed) {
+        changed = false;
+        let best = null;
+        for (let a = 0; a < frs.length; a++) {
+          for (let b = 0; b < frs.length; b++) {
+            if (a === b) continue;
+            const A = frs[a], B = frs[b];
+            if (B.i0 < A.i1 - 3 || B.i0 - A.i1 > maxMerge) continue;       // B must follow A
+            if (Math.sign(A.x1 - A.x0) !== Math.sign(B.x1 - B.x0)) continue; // same direction
+            const pts = A.pts.concat(B.pts);
+            const co = fitParabola(pts.map((p) => p.x / W), pts.map((p) => p.y / H));
+            if (!co || co[0] <= 0) continue;
+            let ok = 0;
+            for (const p of pts) {
+              const u = p.x / W;
+              if (Math.abs(H * (co[0] * u * u + co[1] * u + co[2]) - p.y) < tol * 1.5) ok++;
+            }
+            const frac = ok / pts.length;
+            if (frac < 0.9) continue;
+            const m = accept(co, pts, true);
+            if (m && (!best || frac > best.frac)) best = { a, b, m, frac };
+          }
+        }
+        if (best) {
+          frs = frs.filter((_, k) => k !== best.a && k !== best.b);
+          frs.push(best.m); changed = true;
+        }
+      }
+      return frs;
+    }
+
+    let fragments = [];
     for (const win of windows) {
       let rem = win.slice();
-      for (let k = 0; k < 6 && rem.length >= minInl; k++) {
+      for (let k = 0; k < 30 && rem.length >= 4; k++) {
         const r = ransac(rem);
         if (!r) break;
-        const f = accept(r.co, r.inl);
-        if (f) flights.push(f);
+        const f = accept(r.co, r.inl, true);
+        if (f) fragments.push(f);
         const s = new Set(r.inl);
         rem = rem.filter((p) => !s.has(p));
       }
+    }
+    // join fragments, then keep only complete-looking shots
+    for (const f of mergeFragments(fragments)) {
+      const full = accept(f.co, f.pts, false);
+      if (full) flights.push(full);
     }
     flights.sort((a, b) => a.i0 - b.i0);
     return flights;
@@ -408,6 +485,7 @@
   let color = 'yellow', fileURL = null;
   let W = 0, H = 0, cw = 0, ch = 0;      // analysis size / output size
   let flights = [], times = [], base = null;
+  let goal = null, marking = false, ballPx = 0;
 
   document.querySelectorAll('.chip').forEach((c) => c.addEventListener('click', () => {
     document.querySelectorAll('.chip').forEach((x) => x.classList.remove('on'));
@@ -465,6 +543,10 @@
       f.pts.forEach((p) => { p.t = times[p.i]; });
       f.t0 = f.pts[0].t; f.t1 = f.pts[f.pts.length - 1].t;
     }
+    // ball size in analysis pixels (blob area minus the 1 px dilation border): used as a ruler
+    const ds = [];
+    for (const f of flights) for (const p of f.pts) if (p.a) ds.push(Math.max(2, Math.sqrt(4 * p.a / Math.PI) - 2));
+    ds.sort((a, b) => a - b); ballPx = ds.length ? ds[ds.length >> 1] : 0;
     // grab a clean-ish base frame at full output size
     await seek(0);
     base = document.createElement('canvas'); base.width = cw; base.height = ch;
@@ -520,11 +602,120 @@
       }
     });
   }
+  function extras(ctx) {   // goal marker and label, drawn on top of every picture
+    const s = ctx.canvas.width / W, lw = Math.max(4, ctx.canvas.width * 0.007);
+    if (goal) {
+      const gx = goal.x * s, gy = goal.y * s, r = lw * 5;
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = lw * 0.7;
+      ctx.beginPath(); ctx.arc(gx, gy, r, 0, 6.2832); ctx.moveTo(gx - r * 1.5, gy); ctx.lineTo(gx + r * 1.5, gy);
+      ctx.moveTo(gx, gy - r * 1.5); ctx.lineTo(gx, gy + r * 1.5); ctx.stroke();
+    }
+    const tag = $('tag').value.trim();
+    if (tag) {
+      ctx.font = `bold ${Math.round(lw * 5)}px system-ui,sans-serif`; ctx.textAlign = 'left';
+      const w = ctx.measureText(tag).width;
+      ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(lw * 2, lw * 2, w + lw * 4, lw * 7.5);
+      ctx.fillStyle = '#fff'; ctx.fillText(tag, lw * 4, lw * 7.2);
+    }
+  }
   function redraw() {
     if (!base) return;
-    vctx.drawImage(base, 0, 0); overlay(vctx, null);
+    vctx.drawImage(base, 0, 0); overlay(vctx, null); extras(vctx);
+    renderStats();
   }
   $('ext').addEventListener('input', redraw);
+  $('tag').addEventListener('input', redraw);
+  $('diam').addEventListener('input', renderStats);
+  $('slow').addEventListener('input', renderStats);
+
+  // ---- goal marker -----------------------------------------------------------------------
+  $('goalbtn').addEventListener('click', () => {
+    marking = true; $('goalhint').textContent = 'Now tap the middle of the goal opening on the picture.';
+  });
+  $('goalclr').addEventListener('click', () => { goal = null; marking = false; $('goalclr').classList.add('hidden'); $('goalhint').textContent = 'Tap the goal opening on the picture to measure each shot against it.'; redraw(); });
+  view.addEventListener('click', (e) => {
+    if (!marking) return;
+    const r = view.getBoundingClientRect();
+    goal = { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H };
+    marking = false; $('goalclr').classList.remove('hidden');
+    $('goalhint').textContent = 'Goal marked. Heights below are measured at the goal.';
+    redraw();
+  });
+
+  // ---- stats ---------------------------------------------------------------------------
+  const mean = (a) => a.reduce((s, v) => s + v, 0) / a.length;
+  const sd = (a) => a.length < 2 ? NaN : Math.sqrt(a.reduce((s, v) => s + (v - mean(a)) ** 2, 0) / (a.length - 1));
+  /** Numbers for one shot. Lengths are in analysis pixels until renderStats converts them. */
+  function shotStats(f, xL) {
+    const co = f.co, dxs = Math.sign(f.x1 - f.x0) || 1;
+    const slope = (x) => (H / W) * (2 * co[0] * (x / W) + co[1]);   // dy/dx in pixels
+    const yAt = (x) => ShotCore.yAt(f, x, W, H);
+    // every shot is measured from the same launch x (the earliest-seen start), so they compare fairly
+    const xs0 = xL;
+    const o = { launch: Math.atan(-slope(xs0) * dxs) * 180 / Math.PI };
+    // apex (only if the highest point lies inside the arc between launch and last sighting)
+    let ax = xs0, ay = 1e9; const lo = Math.min(xs0, f.x1), hi = Math.max(xs0, f.x1);
+    for (let x = lo; x <= hi; x += 1) { const y = yAt(x); if (y < ay) { ay = y; ax = x; } }
+    const inner = ay < yAt(xs0) - 1 && ay < yAt(f.x1) - 1;
+    o.apex = inner ? yAt(xs0) - ay : NaN;
+    o.apexDist = inner ? Math.abs(ax - xs0) : NaN;
+    // speed from x(t) (straight-line fit) and the slope at launch
+    const tm = mean(f.pts.map((p) => p.t)), xm = mean(f.pts.map((p) => p.x));
+    let sxy = 0, sxx = 0; for (const p of f.pts) { sxy += (p.t - tm) * (p.x - xm); sxx += (p.t - tm) ** 2; }
+    const vx = sxy / Math.max(1e-9, sxx), vy = slope(xs0) * vx;
+    o.speedPx = Math.hypot(vx, vy);               // pixels per media-second
+    o.time = f.t1 - (f.t0 + (xs0 - f.x0) / vx);   // media-seconds from launch to last sighting
+    // against the goal
+    o.entry = NaN; o.vs = NaN;
+    if (goal) {
+      const far = dxs > 0 ? goal.x - xs0 : xs0 - goal.x;
+      const over = dxs > 0 ? goal.x - f.x1 : f.x1 - goal.x;
+      if (far > 0 && over < 0.15 * W) { o.entry = Math.atan(slope(goal.x) * dxs) * 180 / Math.PI; o.vs = goal.y - yAt(goal.x); }
+    }
+    return o;
+  }
+  const f1 = (v, d = 1) => (Number.isFinite(v) ? v.toFixed(d) : '–');
+  let lastTable = [];
+  function renderStats() {
+    const card = $('statscard');
+    if (!flights.length) { card.classList.add('hidden'); return; }
+    card.classList.remove('hidden');
+    const diam = +$('diam').value, slow = Math.max(1, +$('slow').value || 1);
+    const real = diam > 0 && ballPx > 0;
+    const unit = real ? 'cm' : 'balls', perPx = real ? (diam / 10) / ballPx : 1 / Math.max(1, ballPx);
+    const spUnit = real ? 'm/s' : 'balls/s';
+    $('unitnote').textContent = real
+      ? `Sizes use your ball diameter as a ruler (about ±15%, and best when the shooter is side-on to the camera). Times and speeds use a slow-mo factor of ${slow}×.`
+      : 'Enter the ball diameter (mm) to get centimetres and speeds. Until then, sizes are in ball-widths. All shots are measured from the same launch point.';
+    const dir0 = Math.sign(flights[0].x1 - flights[0].x0) || 1;
+    const xL = dir0 > 0 ? Math.min(...flights.map((f) => f.x0)) : Math.max(...flights.map((f) => f.x0));
+    const rows = flights.map((f, k) => { const o = shotStats(f, xL); return {
+      n: k + 1, launch: o.launch, apex: o.apex * perPx, apexDist: o.apexDist * perPx,
+      speed: real ? o.speedPx * perPx * slow / 100 : o.speedPx * perPx * slow,
+      time: o.time / slow, entry: o.entry, vs: o.vs * perPx }; });
+    const cols = [['Shot', 'n', 0], ['Launch angle (°)', 'launch', 1], [`Apex height (${unit})`, 'apex', 1],
+      [`Apex distance (${unit})`, 'apexDist', 1], [`Speed (${spUnit})`, 'speed', 2], ['Flight time (s)', 'time', 2]];
+    if (goal) { cols.push(['Entry angle (°)', 'entry', 1]); cols.push([`Height at goal (${unit}, + = above)`, 'vs', 1]); }
+    const head = '<tr>' + cols.map((c) => `<th>${c[0]}</th>`).join('') + '</tr>';
+    const body = rows.map((r) => '<tr>' + cols.map((c) => `<td>${c[1] === 'n' ? r.n : f1(r[c[1]], c[2])}</td>`).join('') + '</tr>').join('');
+    const agg = (fn, label) => '<tr class="sum"><td>' + label + '</td>' + cols.slice(1).map((c) => {
+      const vals = rows.map((r) => r[c[1]]).filter(Number.isFinite);
+      return `<td>${vals.length ? f1(fn(vals), c[2]) : '–'}</td>`; }).join('') + '</tr>';
+    $('stats').innerHTML = head + body + (rows.length > 1 ? agg(mean, 'Average') + agg(sd, 'Spread (SD)') : '');
+    lastTable = [cols.map((c) => c[0]), ...rows.map((r) => cols.map((c) => c[1] === 'n' ? r.n : f1(r[c[1]], c[2]))),
+      ...(rows.length > 1 ? [mean, sd].map((fn, i) => [i ? 'Spread (SD)' : 'Average', ...cols.slice(1).map((c) => { const v = rows.map((r) => r[c[1]]).filter(Number.isFinite); return v.length ? f1(fn(v), c[2]) : ''; })]) : [])];
+  }
+  $('csv').addEventListener('click', () => {
+    const q = (v) => '"' + String(v).replace(/"/g, '""') + '"';
+    const tag = $('tag').value.trim();
+    const csv = (tag ? q('Label: ' + tag) + '\n' : '') + lastTable.map((r) => r.map(q).join(',')).join('\n');
+    download(new Blob([csv], { type: 'text/csv' }), 'shot-stats.csv');
+  });
+  $('copy').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(lastTable.map((r) => r.join('\t')).join('\n')); $('copy').textContent = 'Copied!'; }
+    catch (e) { $('copy').textContent = 'Copy not allowed here'; }
+    setTimeout(() => { $('copy').textContent = 'Copy table'; }, 1800);
+  });
 
   // ---- exports --------------------------------------------------------------------------
   $('png').addEventListener('click', () => {
@@ -556,14 +747,14 @@
     await new Promise((resolve) => {
       const loop = () => {
         const t = v.currentTime;
-        rx.drawImage(v, 0, 0, cw, ch); overlay(rx, t);
+        rx.drawImage(v, 0, 0, cw, ch); overlay(rx, t); extras(rx);
         $('vstat').textContent = `Recording… ${Math.min(100, Math.round(100 * (t - tA) / (tB - tA)))}%`;
         if (t >= tB || v.ended) { v.pause(); resolve(); } else requestAnimationFrame(loop);
       };
       requestAnimationFrame(loop);
     });
     // hold the finished picture for two seconds
-    rx.drawImage(base, 0, 0); overlay(rx, null);
+    rx.drawImage(base, 0, 0); overlay(rx, null); extras(rx);
     await new Promise((r) => setTimeout(r, 2000));
     rec.stop(); await stopped;
     download(new Blob(chunks, { type: mime || 'video/webm' }), `shot-trajectories.${ext}`);
