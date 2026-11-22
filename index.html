@@ -8,7 +8,10 @@
   :root { --bg:#0b0d12; --card:#151823; --line:#2c2f45; --txt:#f4f1fa; --dim:#a9a3bd; --acc:#7b2cbf; --acc2:#9d4edd; --green:#4caf50; }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--txt); font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
-  main { max-width: 760px; margin: 0 auto; padding: 20px 16px 60px; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 60px; }
+  .top { max-width: 760px; }
+  .split { display:grid; gap:14px; grid-template-columns: 1fr; align-items:start; }
+  @media (min-width: 900px) { .split { grid-template-columns: minmax(0,430px) minmax(0,1fr); } .split .card { margin-bottom:0; } }
   h1 { font-size: 1.5rem; margin: 6px 0 2px; }
   p.sub { color: var(--dim); margin: 0 0 18px; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 14px; }
@@ -34,17 +37,25 @@
   .tips { color: var(--dim); font-size:.9rem; margin: 0; padding-left: 18px; }
   details summary { cursor:pointer; color: var(--dim); }
   .hidden { display:none; }
+  .tiles { display:grid; grid-template-columns: 1fr 1fr; gap: 2px 18px; margin: 6px 0 4px; }
+  .tile { padding: 12px 0 10px; border-top: 1px solid var(--line); }
+  .tile .lab { font: 600 .68rem ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.09em; text-transform:uppercase; color: var(--dim); }
+  .tile .val { font: 700 1.55rem ui-monospace,SFMono-Regular,Menlo,monospace; margin-top:2px; }
+  .tile .val small { font-size:.8rem; font-weight:600; color: var(--acc2); margin-left:3px; }
+  .tile .sub { font-size:.8rem; color: var(--dim); }
+  h3.sect { margin: 14px 0 4px; font: 600 .68rem ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.09em; text-transform:uppercase; color: var(--dim); }
   input[type=text], input[type=number] { background:#1d2030; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:8px; font:inherit; }
   input[type=text] { flex:1; min-width:180px; } input[type=number] { width:110px; }
   table { border-collapse:collapse; width:100%; font-size:.92rem; }
   th, td { padding:7px 10px; text-align:right; border-bottom:1px solid var(--line); white-space:nowrap; }
-  th:first-child, td:first-child { text-align:left; }
+  th:first-child, td:first-child { text-align:left; white-space:normal; min-width:120px; }
   th { color:var(--dim); font-weight:600; }
-  tr.sum td { color:var(--acc2); font-weight:600; }
+  td.sum { color:var(--acc2); font-weight:600; }
 </style>
 </head>
 <body>
 <main>
+<div class="top">
   <h1>Shot Tracker</h1>
   <p class="sub">Upload a slow-mo clip of your shooter and get every shot's trajectory drawn on one image and one video. Everything runs in your browser; your video is never uploaded.</p>
 
@@ -74,6 +85,8 @@
     <progress id="prog" class="hidden" value="0" max="1"></progress>
   </div>
 
+</div>
+<div class="split">
   <div class="card hidden" id="result">
     <canvas id="view"></canvas>
     <div class="row" style="margin:12px 0 4px">
@@ -93,6 +106,9 @@
       <button id="goalclr" class="sec hidden">Clear goal</button>
       <span id="goalhint" class="tips" style="padding:0">Tap the goal opening on the picture to measure each shot against it.</span>
     </div>
+    <div class="row" style="margin:8px 0">
+      <label><input type="checkbox" id="showstats" checked> Show stats on the picture and video</label>
+    </div>
     <div class="row" style="margin-top:12px">
       <button id="png">Download image (PNG)</button>
       <button id="vid" class="sec">Make video</button>
@@ -106,17 +122,19 @@
       </ul>
     </details>
   </div>
-</main>
-
-<div class="card hidden" id="statscard" style="max-width:760px;margin:0 auto 60px;margin-top:-40px">
-  <h2 style="margin:0 0 4px;font-size:1.1rem">Shot stats</h2>
-  <p class="tips" id="unitnote" style="padding:0 0 8px;margin:0"></p>
-  <div style="overflow-x:auto"><table id="stats"></table></div>
-  <div class="row" style="margin-top:12px">
-    <button id="csv" class="sec">Download CSV</button>
-    <button id="copy" class="sec">Copy table</button>
+  <div class="card hidden" id="statscard">
+    <h2 style="margin:0 0 4px;font-size:1.1rem">Measured arc</h2>
+    <p class="tips" id="unitnote" style="padding:0 0 8px;margin:0"></p>
+    <div class="tiles" id="tiles"></div>
+    <h3 class="sect">Per shot</h3>
+    <div style="overflow-x:auto"><table id="stats"></table></div>
+    <div class="row" style="margin-top:12px">
+      <button id="csv" class="sec">Download CSV</button>
+      <button id="copy" class="sec">Copy table</button>
+    </div>
   </div>
 </div>
+</main>
 
 <video id="v" muted playsinline preload="auto" class="hidden"></video>
 
@@ -486,6 +504,7 @@
   let W = 0, H = 0, cw = 0, ch = 0;      // analysis size / output size
   let flights = [], times = [], base = null;
   let goal = null, marking = false, ballPx = 0;
+  let statRows = [], statUnit = { len: 'balls', sp: 'balls/s' };
 
   document.querySelectorAll('.chip').forEach((c) => c.addEventListener('click', () => {
     document.querySelectorAll('.chip').forEach((x) => x.classList.remove('on'));
@@ -602,7 +621,7 @@
       }
     });
   }
-  function extras(ctx) {   // goal marker and label, drawn on top of every picture
+  function extras(ctx, t = null) {   // goal marker, label and stats panel, drawn on top of every picture
     const s = ctx.canvas.width / W, lw = Math.max(4, ctx.canvas.width * 0.007);
     if (goal) {
       const gx = goal.x * s, gy = goal.y * s, r = lw * 5;
@@ -617,16 +636,50 @@
       ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(lw * 2, lw * 2, w + lw * 4, lw * 7.5);
       ctx.fillStyle = '#fff'; ctx.fillText(tag, lw * 4, lw * 7.2);
     }
+    panel(ctx, t);
+  }
+  /** Stats box in the bottom-left corner. While a video plays, each shot's line appears as that shot finishes. */
+  function panel(ctx, t) {
+    if (!$('showstats').checked || !statRows.length) return;
+    const cwid = ctx.canvas.width, fs = Math.round(cwid * 0.03), pad = fs * 0.6, lh = fs * 1.45;
+    const real = statUnit.len === 'cm', u = real ? ' cm' : ' b';
+    const lines = [];
+    statRows.forEach((r, k) => {
+      if (t !== null && t < flights[k].t1) return;
+      let txt = `  ${f1(r.launch)}°  ${f1(r.apex, 0)}${u}`;
+      if (real) txt += `  ${f1(r.speed)} m/s`;
+      if (goal && Number.isFinite(r.entry)) txt += `  in ${f1(r.entry, 0)}°`;
+      lines.push({ n: '#' + r.n, col: COLORS[k % COLORS.length], txt });
+    });
+    if (t === null && statRows.length > 1) {
+      const m = (key) => mean(statRows.map((r) => r[key]).filter(Number.isFinite));
+      lines.push({ n: 'avg', col: '#c9a6ff', txt: `  ${f1(m('launch'))}°  ${f1(m('apex'), 0)}${u}` + (real ? `  ${f1(m('speed'))} m/s` : '') });
+    }
+    if (!lines.length) return;
+    ctx.font = `bold ${fs}px system-ui,sans-serif`; ctx.textAlign = 'left';
+    const head = 'angle  apex' + (real ? '  speed' : '');
+    const w = Math.max(...lines.map((l) => ctx.measureText(l.n + l.txt).width), ctx.measureText('     ' + head).width) + pad * 2;
+    const h = lines.length * lh + pad * 2 + lh * 0.9, x = pad, y = ctx.canvas.height - h - pad;
+    ctx.fillStyle = 'rgba(8,8,14,.72)'; ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = '#a9a3bd'; ctx.font = `${Math.round(fs * 0.8)}px system-ui,sans-serif`;
+    ctx.fillText('     ' + head, x + pad, y + pad + lh * 0.7);
+    ctx.font = `bold ${fs}px system-ui,sans-serif`;
+    lines.forEach((l, k) => {
+      const yy = y + pad + lh * 0.9 + (k + 0.8) * lh;
+      ctx.fillStyle = l.col; ctx.fillText(l.n, x + pad, yy);
+      ctx.fillStyle = '#fff'; ctx.fillText(l.txt, x + pad + ctx.measureText(l.n).width, yy);
+    });
   }
   function redraw() {
     if (!base) return;
-    vctx.drawImage(base, 0, 0); overlay(vctx, null); extras(vctx);
     renderStats();
+    vctx.drawImage(base, 0, 0); overlay(vctx, null); extras(vctx);
   }
   $('ext').addEventListener('input', redraw);
   $('tag').addEventListener('input', redraw);
-  $('diam').addEventListener('input', renderStats);
-  $('slow').addEventListener('input', renderStats);
+  $('diam').addEventListener('input', redraw);
+  $('slow').addEventListener('input', redraw);
+  $('showstats').addEventListener('change', redraw);
 
   // ---- goal marker -----------------------------------------------------------------------
   $('goalbtn').addEventListener('click', () => {
@@ -678,7 +731,7 @@
   let lastTable = [];
   function renderStats() {
     const card = $('statscard');
-    if (!flights.length) { card.classList.add('hidden'); return; }
+    if (!flights.length) { statRows = []; card.classList.add('hidden'); return; }
     card.classList.remove('hidden');
     const diam = +$('diam').value, slow = Math.max(1, +$('slow').value || 1);
     const real = diam > 0 && ballPx > 0;
@@ -696,12 +749,23 @@
     const cols = [['Shot', 'n', 0], ['Launch angle (°)', 'launch', 1], [`Apex height (${unit})`, 'apex', 1],
       [`Apex distance (${unit})`, 'apexDist', 1], [`Speed (${spUnit})`, 'speed', 2], ['Flight time (s)', 'time', 2]];
     if (goal) { cols.push(['Entry angle (°)', 'entry', 1]); cols.push([`Height at goal (${unit}, + = above)`, 'vs', 1]); }
-    const head = '<tr>' + cols.map((c) => `<th>${c[0]}</th>`).join('') + '</tr>';
-    const body = rows.map((r) => '<tr>' + cols.map((c) => `<td>${c[1] === 'n' ? r.n : f1(r[c[1]], c[2])}</td>`).join('') + '</tr>').join('');
-    const agg = (fn, label) => '<tr class="sum"><td>' + label + '</td>' + cols.slice(1).map((c) => {
-      const vals = rows.map((r) => r[c[1]]).filter(Number.isFinite);
-      return `<td>${vals.length ? f1(fn(vals), c[2]) : '–'}</td>`; }).join('') + '</tr>';
-    $('stats').innerHTML = head + body + (rows.length > 1 ? agg(mean, 'Average') + agg(sd, 'Spread (SD)') : '');
+    statRows = rows; statUnit = { len: unit, sp: spUnit };
+    if (slow === 1 && mean(rows.map((r) => r.time)) > 0.8) $('unitnote').textContent += ' Flight times this long usually mean the clip is slowed down: enter the slow-mo factor so speeds come out right.';
+    // shown with one column per shot (fits side by side without scrolling); CSV/copy keep one row per shot
+    const col = (key) => rows.map((r) => r[key]);
+    const stat = (fn, key) => { const v = col(key).filter(Number.isFinite); return v.length ? fn(v) : NaN; };
+    let head = '<tr><th>Stat</th>' + rows.map((r) => `<th>Shot ${r.n}</th>`).join('') + (rows.length > 1 ? '<th>Average</th><th>Spread (SD)</th>' : '') + '</tr>';
+    const body = cols.slice(1).map((c) => '<tr><td>' + c[0] + '</td>' + rows.map((r) => `<td>${f1(r[c[1]], c[2])}</td>`).join('') +
+      (rows.length > 1 ? `<td class="sum">${f1(stat(mean, c[1]), c[2])}</td><td class="sum">${f1(stat(sd, c[1]), c[2])}</td>` : '') + '</tr>').join('');
+    $('stats').innerHTML = head + body;
+    const tileDefs = [['Launch angle', 'launch', '°', 1], ['Exit speed', 'speed', spUnit, 2], ['Apex height', 'apex', unit, 1],
+      ['Time of flight', 'time', 's', 2], ['Apex distance', 'apexDist', unit, 1]];
+    if (goal) tileDefs.push(['Entry angle', 'entry', '°', 1], [`Height at goal (+ above)`, 'vs', unit, 1]);
+    $('tiles').innerHTML = tileDefs.map(([lab, key, u, d]) => {
+      const n = col(key).filter(Number.isFinite).length;
+      const sub = n > 1 ? `± ${f1(stat(sd, key), d)} · average of ${n} shots` : n === 1 ? 'one shot' : 'not reached';
+      return `<div class="tile"><div class="lab">${lab}</div><div class="val">${f1(stat(mean, key), d)}<small>${u}</small></div><div class="sub">${sub}</div></div>`;
+    }).join('');
     lastTable = [cols.map((c) => c[0]), ...rows.map((r) => cols.map((c) => c[1] === 'n' ? r.n : f1(r[c[1]], c[2]))),
       ...(rows.length > 1 ? [mean, sd].map((fn, i) => [i ? 'Spread (SD)' : 'Average', ...cols.slice(1).map((c) => { const v = rows.map((r) => r[c[1]]).filter(Number.isFinite); return v.length ? f1(fn(v), c[2]) : ''; })]) : [])];
   }
@@ -747,7 +811,7 @@
     await new Promise((resolve) => {
       const loop = () => {
         const t = v.currentTime;
-        rx.drawImage(v, 0, 0, cw, ch); overlay(rx, t); extras(rx);
+        rx.drawImage(v, 0, 0, cw, ch); overlay(rx, t); extras(rx, t);
         $('vstat').textContent = `Recording… ${Math.min(100, Math.round(100 * (t - tA) / (tB - tA)))}%`;
         if (t >= tB || v.ended) { v.pause(); resolve(); } else requestAnimationFrame(loop);
       };
