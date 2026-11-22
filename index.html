@@ -38,6 +38,9 @@
   .tips { color: var(--dim); font-size:.9rem; margin: 0; padding-left: 18px; }
   details summary { cursor:pointer; color: var(--dim); }
   .hidden { display:none; }
+  .badge { display:inline-block; padding:4px 12px; border-radius:999px; background: rgba(123,44,191,.22); border:1px solid var(--acc); color:#d9c2ff; font-size:.78rem; font-weight:600; letter-spacing:.04em; }
+  footer { margin-top: 28px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--dim); font-size:.85rem; }
+  footer b { color:#d9c2ff; }
   .tiles { display:grid; grid-template-columns: 1fr 1fr; gap: 2px 18px; margin: 6px 0 4px; }
   .tile { padding: 12px 0 10px; border-top: 1px solid var(--line); }
   .tile .lab { font: 600 .68rem ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.09em; text-transform:uppercase; color: var(--dim); }
@@ -57,8 +60,9 @@
 <body>
 <main>
 <div class="top">
+  <div class="badge">RESET Robotics · FTC Team #35755</div>
   <h1>Shot Tracker</h1>
-  <p class="sub">Upload a slow-mo clip of your shooter and get every shot's trajectory drawn on one image and one video. Everything runs in your browser; your video is never uploaded.</p>
+  <p class="sub">Upload a slow-mo clip of your shooter and get every shot's trajectory drawn on one image and one video. Everything runs in your browser; your video is never uploaded. Made by RESET Robotics for any team to use.</p>
 
   <div class="card">
     <input type="file" id="file" accept="video/*">
@@ -110,6 +114,9 @@
     <div class="row" style="margin:8px 0">
       <label><input type="checkbox" id="showstats" checked> Show stats on the picture and video</label>
     </div>
+    <div class="row" style="margin:8px 0">
+      <label><input type="checkbox" id="credit" checked> Add “Made with RESET Robotics Shot Tracker” to the picture and video</label>
+    </div>
     <div class="row" style="margin-top:12px">
       <button id="png">Download image (PNG)</button>
       <button id="vid" class="sec">Make video</button>
@@ -135,6 +142,7 @@
     </div>
   </div>
 </div>
+<footer>Made by <b>RESET Robotics</b> · FTC Team #35755 · Free for every team to use</footer>
 </main>
 
 <video id="v" muted playsinline preload="auto" class="hidden"></video>
@@ -638,6 +646,13 @@
       ctx.fillStyle = '#fff'; ctx.fillText(tag, lw * 4, lw * 7.2);
     }
     panel(ctx, t);
+    if ($('credit').checked) {   // small credit, bottom-right
+      const fs = Math.round(ctx.canvas.width * 0.024), msg = 'Made with RESET Robotics Shot Tracker';
+      ctx.font = `600 ${fs}px system-ui,sans-serif`; ctx.textAlign = 'right';
+      const w = ctx.measureText(msg).width, pad = fs * 0.5;
+      ctx.fillStyle = 'rgba(80,20,140,.75)'; ctx.fillRect(ctx.canvas.width - w - pad * 3, ctx.canvas.height - fs * 2.1, w + pad * 2, fs * 1.6);
+      ctx.fillStyle = '#fff'; ctx.fillText(msg, ctx.canvas.width - pad * 2, ctx.canvas.height - fs * 0.85);
+    }
   }
   /** Stats box in the bottom-left corner. While a video plays, each shot's line appears as that shot finishes. */
   function panel(ctx, t) {
@@ -681,6 +696,7 @@
   $('diam').addEventListener('input', redraw);
   $('slow').addEventListener('input', redraw);
   $('showstats').addEventListener('change', redraw);
+  $('credit').addEventListener('change', redraw);
 
   // ---- goal marker -----------------------------------------------------------------------
   $('goalbtn').addEventListener('click', () => {
